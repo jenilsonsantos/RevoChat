@@ -1,17 +1,15 @@
-version: '3'
+x-base: &base
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    args:
+      RAILS_ENV: production
+  image: revochat:latest
+  env_file: .env ## Change this file for customized env variables
+  volumes:
+    - storage_data:/app/storage
 
 services:
-  base: &base
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-      args:
-        RAILS_ENV: production
-    image: revochat:latest
-    env_file: .env ## Change this file for customized env variables
-    volumes:
-      - storage_data:/app/storage
-
   rails:
     <<: *base
     depends_on:

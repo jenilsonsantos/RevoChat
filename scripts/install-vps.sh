@@ -2,51 +2,75 @@
 #
 # RevoChat (Chatwoot) - Instalação automatizada em Ubuntu VPS
 # ------------------------------------------------------------
-# O que este script faz:
+# O que este script faz, do zero, sem intervenção manual:
 #   1. Instala Docker + Docker Compose plugin, Nginx, Certbot e UFW
 #   2. Clona (ou atualiza) o repositório RevoChat
-#   3. Gera automaticamente todos os segredos (SECRET_KEY_BASE, senhas do
+#   3. Corrige permissões de execução dos scripts (garantia extra,
+#      independente do que estiver commitado no Git)
+#   4. Gera automaticamente todos os segredos (SECRET_KEY_BASE, senhas do
 #      Postgres/Redis, chaves de criptografia) - nada fica com valor padrão
-#   4. Builda a imagem Docker a partir do próprio código do repositório
-#   5. Prepara o banco de dados (rails db:chatwoot_prepare)
-#   6. Sobe os containers (rails, sidekiq, postgres, redis)
-#   7. Configura o Nginx como proxy reverso para o seu domínio
-#   8. Emite certificado SSL via Let's Encrypt (Certbot) e configura renovação automática
-#   9. Habilita o firewall (UFW) liberando apenas SSH, HTTP e HTTPS
+#   5. Builda a imagem Docker a partir do próprio código do repositório
+#   6. Prepara o banco de dados (rails db:chatwoot_prepare)
+#   7. Sobe os containers (rails, sidekiq, postgres, redis)
+#   8. Configura o Nginx como proxy reverso para o seu domínio
+#   9. Emite certificado SSL via Let's Encrypt (Certbot) e configura renovação automática
+#  10. Habilita o firewall (UFW) liberando apenas SSH, HTTP e HTTPS
+#  11. Faz uma verificação final (healthcheck) e mostra o resultado
 #
 # Requisitos antes de rodar:
 #   - Ubuntu 22.04/24.04 (VPS limpa, de preferência)
 #   - Acesso root (rode com sudo ou como root)
 #   - Um domínio (ex: chat.seudominio.com) com registro A apontando para o IP da VPS
 #
-# Como usar:
+# Como usar (interativo):
 #   wget -O install-vps.sh https://raw.githubusercontent.com/jenilsonsantos/RevoChat/main/scripts/install-vps.sh
 #   chmod +x install-vps.sh
 #   sudo ./install-vps.sh
+#
+# Como usar (totalmente não-interativo, ex: automação/CI):
+#   sudo DOMAIN=chat.seudominio.com CERTBOT_EMAIL=voce@seudominio.com ./install-vps.sh --yes
 #
 set -euo pipefail
 
 REPO_URL="https://github.com/jenilsonsantos/RevoChat.git"
 INSTALL_DIR="/opt/revochat"
+COMPOSE_FILE="docker-compose.production.yaml"
+ASSUME_YES=false
+
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes) ASSUME_YES=true ;;
+  esac
+done
 
 log()  { echo -e "\e[1;32m[revochat]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[revochat]\e[0m $*"; }
-die()  { echo -e "\e[1;31m[revochat]\e[0m $*" >&2; exit 1; }
+err()  { echo -e "\e[1;31m[revochat]\e[0m $*" >&2; }
+die()  { err "$*"; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Execute este script como root (sudo ./install-vps.sh)."
 
 # ---------------------------------------------------------------------------
-# 1. Coleta de informações
+# 1. Coleta de informações (pode vir de variáveis de ambiente para modo automático)
 # ---------------------------------------------------------------------------
-read -rp "Informe o domínio que vai apontar para o RevoChat (ex: chat.seudominio.com): " DOMAIN
+DOMAIN="${DOMAIN:-}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
+
+if [[ -z "$DOMAIN" ]]; then
+  read -rp "Informe o domínio que vai apontar para o RevoChat (ex: chat.seudominio.com): " DOMAIN
+fi
 [[ -n "$DOMAIN" ]] || die "Domínio é obrigatório."
 
-read -rp "Informe um e-mail válido (usado pelo Let's Encrypt para avisos de expiração): " CERTBOT_EMAIL
+if [[ -z "$CERTBOT_EMAIL" ]]; then
+  read -rp "Informe um e-mail válido (usado pelo Let's Encrypt para avisos de expiração): " CERTBOT_EMAIL
+fi
 [[ -n "$CERTBOT_EMAIL" ]] || die "E-mail é obrigatório."
 
-log "Verifique se o registro DNS tipo A de $DOMAIN já aponta para o IP público desta VPS."
-read -rp "Confirma que o DNS já está configurado? (s/N): " DNS_OK
-[[ "$DNS_OK" =~ ^[sS]$ ]] || die "Configure o DNS antes de continuar e rode o script novamente."
+if [[ "$ASSUME_YES" != true ]]; then
+  log "Verifique se o registro DNS tipo A de $DOMAIN já aponta para o IP público desta VPS."
+  read -rp "Confirma que o DNS já está configurado? (s/N): " DNS_OK
+  [[ "$DNS_OK" =~ ^[sS]$ ]] || die "Configure o DNS antes de continuar e rode o script novamente."
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Dependências do sistema
@@ -55,8 +79,8 @@ log "Atualizando pacotes do sistema..."
 apt-get update -y
 apt-get upgrade -y
 
-log "Instalando dependências básicas (curl, git, ufw)..."
-apt-get install -y curl git ufw ca-certificates gnupg
+log "Instalando dependências básicas (curl, git, ufw, dnsutils)..."
+apt-get install -y curl git ufw ca-certificates gnupg dnsutils
 
 if ! command -v docker &>/dev/null; then
   log "Instalando Docker..."
@@ -105,7 +129,16 @@ fi
 cd "$INSTALL_DIR"
 
 # ---------------------------------------------------------------------------
-# 5. Geração do .env com segredos únicos
+# 5. Garante permissão de execução nos scripts usados pelo Docker
+#    (Não depende só do Git; corrige mesmo se algo vier sem +x)
+# ---------------------------------------------------------------------------
+log "Garantindo permissões de execução nos entrypoints..."
+find docker/entrypoints -type f \( -name "*.sh" -o -name "*.rb" \) -exec chmod +x {} \;
+chmod +x scripts/*.sh 2>/dev/null || true
+chmod +x deployment/*.sh 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 6. Geração do .env com segredos únicos
 # ---------------------------------------------------------------------------
 if [[ -f .env ]]; then
   warn ".env já existe, mantendo o arquivo atual (não será sobrescrito)."
@@ -136,19 +169,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Build e preparação do banco de dados
+# 7. Build e preparação do banco de dados
 # ---------------------------------------------------------------------------
-log "Buildando a imagem Docker do RevoChat (isso pode levar alguns minutos)..."
-docker compose -f docker-compose.production.yaml build
+log "Buildando a imagem Docker do RevoChat (isso pode levar bastante tempo na primeira vez)..."
+docker compose -f "$COMPOSE_FILE" build
+
+log "Subindo Postgres e Redis primeiro, para garantir que estejam prontos..."
+docker compose -f "$COMPOSE_FILE" up -d postgres redis
+
+log "Aguardando o Postgres aceitar conexões..."
+for i in $(seq 1 30); do
+  if docker compose -f "$COMPOSE_FILE" exec -T postgres pg_isready -U postgres &>/dev/null; then
+    break
+  fi
+  sleep 2
+done
 
 log "Preparando o banco de dados..."
-docker compose -f docker-compose.production.yaml run --rm rails bundle exec rails db:chatwoot_prepare
+docker compose -f "$COMPOSE_FILE" run --rm rails bundle exec rails db:chatwoot_prepare
 
-log "Subindo os containers..."
-docker compose -f docker-compose.production.yaml up -d
+log "Subindo todos os containers..."
+docker compose -f "$COMPOSE_FILE" up -d
 
 # ---------------------------------------------------------------------------
-# 7. Configuração do Nginx (proxy reverso)
+# 8. Configuração do Nginx (proxy reverso)
 # ---------------------------------------------------------------------------
 log "Configurando Nginx para o domínio $DOMAIN..."
 mkdir -p /var/www/ssl-proof/revochat/.well-known
@@ -193,16 +237,41 @@ nginx -t
 systemctl reload nginx
 
 # ---------------------------------------------------------------------------
-# 8. Certificado SSL via Let's Encrypt
+# 9. Certificado SSL via Let's Encrypt
 # ---------------------------------------------------------------------------
-log "Emitindo certificado SSL para $DOMAIN via Let's Encrypt..."
-certbot --nginx -d "$DOMAIN" -m "$CERTBOT_EMAIL" --agree-tos --redirect --non-interactive
+log "Verificando se o DNS de $DOMAIN já resolve para o IP público desta VPS..."
+PUBLIC_IP=$(curl -fsSL https://checkip.amazonaws.com || true)
+DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1 || true)
 
-log "Certbot instalado. A renovação automática já é configurada via systemd timer (certbot.timer)."
+if [[ -n "$PUBLIC_IP" && -n "$DOMAIN_IP" && "$PUBLIC_IP" != "$DOMAIN_IP" ]]; then
+  warn "O domínio $DOMAIN resolve para $DOMAIN_IP, mas o IP público desta VPS é $PUBLIC_IP."
+  warn "O Certbot pode falhar até o DNS propagar corretamente."
+fi
+
+log "Emitindo certificado SSL para $DOMAIN via Let's Encrypt..."
+if certbot --nginx -d "$DOMAIN" -m "$CERTBOT_EMAIL" --agree-tos --redirect --non-interactive; then
+  log "Certificado SSL emitido com sucesso."
+else
+  err "Falha ao emitir o certificado SSL. Verifique se o DNS já propagou e rode manualmente:"
+  err "  certbot --nginx -d ${DOMAIN} -m ${CERTBOT_EMAIL} --agree-tos --redirect"
+fi
+
 systemctl enable --now certbot.timer 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 9. Finalização
+# 10. Verificação final
+# ---------------------------------------------------------------------------
+log "Verificando se a aplicação está respondendo..."
+sleep 5
+if curl -ksI "https://${DOMAIN}" | head -n1 | grep -qE "HTTP/.* (200|301|302)"; then
+  log "Aplicação respondendo corretamente em https://${DOMAIN}"
+else
+  warn "Não foi possível confirmar automaticamente que https://${DOMAIN} está respondendo."
+  warn "Verifique com: curl -I https://${DOMAIN}"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. Finalização
 # ---------------------------------------------------------------------------
 log "----------------------------------------------------------------------"
 log "Instalação concluída!"
@@ -211,8 +280,8 @@ log "Diretório da aplicação: ${INSTALL_DIR}"
 log "Arquivo de configuração: ${INSTALL_DIR}/.env"
 log ""
 log "Comandos úteis:"
-log "  Ver logs do Rails:    cd ${INSTALL_DIR} && docker compose -f docker-compose.production.yaml logs -f rails"
-log "  Ver logs do Sidekiq:  cd ${INSTALL_DIR} && docker compose -f docker-compose.production.yaml logs -f sidekiq"
-log "  Reiniciar tudo:       cd ${INSTALL_DIR} && docker compose -f docker-compose.production.yaml restart"
-log "  Atualizar RevoChat:   cd ${INSTALL_DIR} && git pull && docker compose -f docker-compose.production.yaml build && docker compose -f docker-compose.production.yaml run --rm rails bundle exec rails db:chatwoot_prepare && docker compose -f docker-compose.production.yaml up -d"
+log "  Ver logs do Rails:    cd ${INSTALL_DIR} && docker compose -f ${COMPOSE_FILE} logs -f rails"
+log "  Ver logs do Sidekiq:  cd ${INSTALL_DIR} && docker compose -f ${COMPOSE_FILE} logs -f sidekiq"
+log "  Reiniciar tudo:       cd ${INSTALL_DIR} && docker compose -f ${COMPOSE_FILE} restart"
+log "  Atualizar RevoChat:   cd ${INSTALL_DIR} && git pull && docker compose -f ${COMPOSE_FILE} build && docker compose -f ${COMPOSE_FILE} run --rm rails bundle exec rails db:chatwoot_prepare && docker compose -f ${COMPOSE_FILE} up -d"
 log "----------------------------------------------------------------------"
